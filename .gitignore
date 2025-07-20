@@ -1,0 +1,19 @@
+node_modules
+.DS_STORE
+.kiro
+
+# Security - prevent accidental credential commits
+*.pem
+*.key
+.env
+.env.local
+.env.production
+.env.staging
+aws-credentials.txt
+credentials.json
+config.json
+
+# Temporary files
+~$*
+*.tmp
+*.temp
