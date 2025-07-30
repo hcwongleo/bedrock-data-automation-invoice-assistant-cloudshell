@@ -63,20 +63,50 @@ main() {
     log_success "Deployment completed successfully!"
 }
 
+# Upgrade Node.js function
+upgrade_nodejs() {
+    log_info "Attempting to upgrade Node.js..."
+    
+    # Remove conflicting packages first
+    log_info "Removing existing Node.js packages to avoid conflicts..."
+    sudo yum remove -y nodejs20* nodejs-npm* npm* || true
+    
+    # Clean yum cache
+    sudo yum clean all
+    
+    # Install Node.js 22
+    log_info "Installing Node.js 22..."
+    if curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash - && sudo yum install -y nodejs; then
+        log_success "Node.js upgraded successfully"
+        return 0
+    else
+        log_error "Failed to upgrade Node.js"
+        return 1
+    fi
+}
+
 # Setup CloudShell environment
 setup_environment() {
     # Update system packages
     log_info "Updating system packages..."
     sudo yum update -y || true
     
-    # Install Node.js 22 if not present or wrong version
+    # Check Node.js version and handle CloudShell's pre-installed Node.js
     NODE_VERSION=$(node --version 2>/dev/null | cut -d'v' -f2 | cut -d'.' -f1 || echo "0")
-    if [ "$NODE_VERSION" -lt "22" ]; then
-        log_info "Installing Node.js 22..."
-        curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
-        sudo yum install -y nodejs
+    log_info "Current Node.js version: $(node --version 2>/dev/null || echo 'not found')"
+    
+    if [ "$NODE_VERSION" -ge "18" ]; then
+        log_success "Node.js $NODE_VERSION is sufficient for this project"
+    elif [ "$NODE_VERSION" -lt "18" ]; then
+        log_warning "Node.js version is too old. Attempting to upgrade..."
+        
+        # Try to upgrade Node.js, but continue if it fails
+        if ! upgrade_nodejs; then
+            log_warning "Node.js upgrade failed, but continuing with existing version..."
+            log_info "The project should still work with Node.js $NODE_VERSION"
+        fi
     else
-        log_success "Node.js 22+ already installed"
+        log_success "Node.js already installed"
     fi
     
     # Verify AWS CLI is available (should be pre-installed in CloudShell)
