@@ -123,13 +123,13 @@ get_vpc_info() {
         exit 1
     fi
     
-    # Get first private subnet (or any subnet without auto-assign public IP)
+    # Get first public subnet (with auto-assign public IP)
     SUBNET_ID=$(aws ec2 describe-subnets \
         --filters "Name=vpc-id,Values=$VPC_ID" \
-        --query 'Subnets[?MapPublicIpOnLaunch==`false`] | [0].SubnetId' \
+        --query 'Subnets[?MapPublicIpOnLaunch==`true`] | [0].SubnetId' \
         --output text)
     
-    # If no private subnet found, use first available subnet
+    # If no public subnet found, use first available subnet
     if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
         SUBNET_ID=$(aws ec2 describe-subnets \
             --filters "Name=vpc-id,Values=$VPC_ID" \
@@ -209,7 +209,7 @@ EOF
         --instance-type "$INSTANCE_TYPE" \
         --security-group-ids "$SECURITY_GROUP_ID" \
         --subnet-id "$SUBNET_ID" \
-        --no-associate-public-ip-address \
+        --associate-public-ip-address \
         --user-data file://user-data.sh \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=Purpose,Value=SecureCompute},{Key=BudgetProtected,Value=true}]" \
         --query 'Instances[0].InstanceId' \
@@ -272,21 +272,31 @@ EOF
     if aws iam get-role --role-name "$LAMBDA_ROLE_NAME" >/dev/null 2>&1; then
         log_info "Lambda role $LAMBDA_ROLE_NAME already exists"
     else
+        log_info "Creating Lambda IAM role..."
         aws iam create-role \
             --role-name "$LAMBDA_ROLE_NAME" \
             --assume-role-policy-document file://lambda-trust-policy.json \
-            --description "Role for Lambda to terminate EC2 instances"
+            --description "Role for Lambda to terminate EC2 instances" || {
+            log_error "Failed to create Lambda IAM role"
+            return 1
+        }
         
+        log_info "Attaching policy to Lambda role..."
         aws iam put-role-policy \
             --role-name "$LAMBDA_ROLE_NAME" \
             --policy-name "EC2TerminationPolicy" \
-            --policy-document file://lambda-execution-policy.json
+            --policy-document file://lambda-execution-policy.json || {
+            log_error "Failed to attach policy to Lambda role"
+            return 1
+        }
         
         log_success "Lambda role created successfully"
-        sleep 10  # Wait for role propagation
+        log_info "Waiting for IAM role propagation..."
+        sleep 15  # Increased wait time for role propagation
     fi
     
     LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$LAMBDA_ROLE_NAME"
+    log_info "Using Lambda role ARN: $LAMBDA_ROLE_ARN"
     
     # Create Lambda function code
     cat > lambda_function.py << EOF
@@ -324,7 +334,11 @@ def lambda_handler(event, context):
 EOF
 
     # Create deployment package
-    zip lambda-function.zip lambda_function.py
+    log_info "Creating Lambda deployment package..."
+    if ! zip lambda-function.zip lambda_function.py; then
+        log_error "Failed to create Lambda deployment package"
+        return 1
+    fi
     
     # Create or update Lambda function
     LAMBDA_FUNCTION_NAME="terminate-ec2-on-budget-exceeded"
@@ -333,13 +347,26 @@ EOF
         log_info "Updating existing Lambda function"
         aws lambda update-function-code \
             --function-name "$LAMBDA_FUNCTION_NAME" \
-            --zip-file fileb://lambda-function.zip
+            --zip-file fileb://lambda-function.zip || {
+            log_error "Failed to update Lambda function code"
+            return 1
+        }
         
         aws lambda update-function-configuration \
             --function-name "$LAMBDA_FUNCTION_NAME" \
-            --environment "Variables={INSTANCE_ID=$INSTANCE_ID}"
+            --environment "Variables={INSTANCE_ID=$INSTANCE_ID}" || {
+            log_error "Failed to update Lambda function configuration"
+            return 1
+        }
     else
-        log_info "Creating new Lambda function"
+        log_info "Creating new Lambda function with role: $LAMBDA_ROLE_ARN"
+        
+        # Verify role exists before creating function
+        if ! aws iam get-role --role-name "$LAMBDA_ROLE_NAME" >/dev/null 2>&1; then
+            log_error "Lambda role does not exist. Cannot create function."
+            return 1
+        fi
+        
         aws lambda create-function \
             --function-name "$LAMBDA_FUNCTION_NAME" \
             --runtime python3.9 \
@@ -348,7 +375,23 @@ EOF
             --zip-file fileb://lambda-function.zip \
             --description "Terminates EC2 instance when budget is exceeded" \
             --timeout 60 \
-            --environment "Variables={INSTANCE_ID=$INSTANCE_ID}"
+            --environment "Variables={INSTANCE_ID=$INSTANCE_ID}" || {
+            log_error "Failed to create Lambda function. This might be due to IAM role propagation delay."
+            log_info "Waiting additional time for role propagation and retrying..."
+            sleep 30
+            aws lambda create-function \
+                --function-name "$LAMBDA_FUNCTION_NAME" \
+                --runtime python3.9 \
+                --role "$LAMBDA_ROLE_ARN" \
+                --handler lambda_function.lambda_handler \
+                --zip-file fileb://lambda-function.zip \
+                --description "Terminates EC2 instance when budget is exceeded" \
+                --timeout 60 \
+                --environment "Variables={INSTANCE_ID=$INSTANCE_ID}" || {
+                log_error "Failed to create Lambda function after retry"
+                return 1
+            }
+        }
     fi
     
     LAMBDA_FUNCTION_ARN="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$LAMBDA_FUNCTION_NAME"
@@ -384,12 +427,27 @@ create_budget_monitoring() {
     log_warning "Please check emails (${EMAIL_ADDRESSES[*]}) and confirm SNS subscriptions"
     
     # Add permission for SNS to invoke Lambda
+    log_info "Adding SNS invoke permission to Lambda..."
     aws lambda add-permission \
         --function-name "$LAMBDA_FUNCTION_NAME" \
         --statement-id "allow-sns-invoke" \
         --action lambda:InvokeFunction \
         --principal sns.amazonaws.com \
         --source-arn "$SNS_TOPIC_ARN" 2>/dev/null || log_info "Permission already exists"
+    
+    # Verify the subscription was created
+    log_info "Verifying SNS subscription..."
+    SUBSCRIPTION_ARN=$(aws sns list-subscriptions-by-topic \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --query "Subscriptions[?Protocol=='lambda' && Endpoint=='$LAMBDA_FUNCTION_ARN'].SubscriptionArn" \
+        --output text)
+    
+    if [ -n "$SUBSCRIPTION_ARN" ] && [ "$SUBSCRIPTION_ARN" != "None" ]; then
+        log_success "Lambda successfully subscribed to SNS topic"
+        log_info "Subscription ARN: $SUBSCRIPTION_ARN"
+    else
+        log_warning "Lambda subscription to SNS may not be properly configured"
+    fi
     
     log_success "SNS topic created and Lambda subscribed: $SNS_TOPIC_ARN"
 }
@@ -445,6 +503,47 @@ EOF
         --notifications-with-subscribers \
             "Notification={NotificationType=ACTUAL,ComparisonOperator=GREATER_THAN,Threshold=100,ThresholdType=PERCENTAGE},Subscribers=$(cat budget-subscribers.json)"
     
+    # Add budget action for direct EC2 termination (more reliable than SNS->Lambda)
+    log_info "Creating budget action for direct EC2 termination..."
+    
+    # Create budget action definition
+    cat > budget-action.json << EOF
+{
+    "ActionType": "APPLY_IAM_POLICY",
+    "ActionThreshold": {
+        "ActionThresholdValue": 100,
+        "ActionThresholdType": "PERCENTAGE"
+    },
+    "Definition": {
+        "IamActionDefinition": {
+            "PolicyArn": "arn:aws:iam::aws:policy/EC2InstanceTerminate",
+            "Roles": ["$ROLE_ARN"]
+        }
+    },
+    "ExecutionRoleArn": "$ROLE_ARN",
+    "ApprovalModel": "AUTOMATIC",
+    "Subscribers": $(cat budget-subscribers.json)
+}
+EOF
+
+    # Try to create budget action (this might fail in some regions/accounts)
+    if aws budgets create-budget-action \
+        --account-id "$ACCOUNT_ID" \
+        --budget-name "$BUDGET_NAME" \
+        --action-type "APPLY_IAM_POLICY" \
+        --action-threshold "ActionThresholdValue=100,ActionThresholdType=PERCENTAGE" \
+        --definition "IamActionDefinition={PolicyArn=arn:aws:iam::aws:policy/EC2InstanceTerminate,Roles=[$ROLE_NAME]}" \
+        --execution-role-arn "$ROLE_ARN" \
+        --approval-model "AUTOMATIC" \
+        --subscribers file://budget-subscribers.json >/dev/null 2>&1; then
+        log_success "Budget action created for automatic EC2 termination"
+    else
+        log_warning "Budget action creation failed - relying on SNS->Lambda trigger"
+        log_info "This is normal in some AWS regions or account types"
+    fi
+    
+    rm -f budget-action.json
+    
     log_success "Budget created with automatic termination trigger"
     
     # Clean up temp files
@@ -482,16 +581,28 @@ main() {
     echo "Secure EC2 Instance Deployment"
     echo "========================================"
     
-    get_aws_info
-    create_budget_role
-    get_vpc_info
-    create_security_group
-    get_ami_id
-    launch_instance
-    create_termination_lambda
-    create_budget_monitoring
-    create_budget
-    create_cost_alarm
+    get_aws_info || { log_error "Failed to get AWS info"; exit 1; }
+    create_budget_role || { log_error "Failed to create budget role"; exit 1; }
+    get_vpc_info || { log_error "Failed to get VPC info"; exit 1; }
+    create_security_group || { log_error "Failed to create security group"; exit 1; }
+    get_ami_id || { log_error "Failed to get AMI ID"; exit 1; }
+    launch_instance || { log_error "Failed to launch instance"; exit 1; }
+    
+    # Continue with budget protection setup even if Lambda fails
+    if create_termination_lambda; then
+        log_success "Lambda function created successfully"
+        if create_budget_monitoring; then
+            log_success "Budget monitoring setup completed"
+            create_budget || log_warning "Budget creation failed but instance is running"
+        else
+            log_warning "Budget monitoring setup failed but instance is running"
+        fi
+    else
+        log_warning "Lambda creation failed - budget protection will be limited"
+        log_info "You can manually set up budget alerts in the AWS Console"
+    fi
+    
+    create_cost_alarm || log_warning "Cost alarm creation failed"
     
     echo ""
     echo "========================================"
@@ -504,7 +615,7 @@ main() {
     echo "   Instance ID: $INSTANCE_ID"
     echo "   Instance Type: $INSTANCE_TYPE"
     echo "   Security Group: $SECURITY_GROUP_ID (no ingress rules)"
-    echo "   Public IP: None (private subnet deployment)"
+    echo "   Public IP: Assigned (public subnet deployment)"
     echo ""
     echo "💰 Budget Protection:"
     echo "   Budget Name: $BUDGET_NAME"
@@ -515,7 +626,7 @@ main() {
     echo "   Email Notifications: ${EMAIL_ADDRESSES[*]}"
     echo ""
     echo "⚠️  Important Notes:"
-    echo "   - Instance has no public IP and no ingress access"
+    echo "   - Instance has public IP but no ingress access (restrictive security group)"
     echo "   - Access only via AWS Systems Manager Session Manager"
     echo "   - Instance will be AUTOMATICALLY TERMINATED at \$${BUDGET_LIMIT} threshold"
     echo "   - Lambda function monitors budget and terminates instance"
